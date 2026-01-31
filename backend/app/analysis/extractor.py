@@ -3,12 +3,18 @@ Audio feature extraction for DJMashAI.
 Produces Track Feature Object (BPM, key, energy curve, intro/outro, drop regions).
 """
 
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import librosa
 import numpy as np
 from pydantic import BaseModel, Field
+
+# Formats that often fail with librosa on Windows (need ffmpeg for audioread or conversion)
+_FFMPEG_FALLBACK_EXTS = (".m4a", ".aac", ".webm", ".opus", ".mp4")
 
 
 # Key names for chroma-based key detection (C, C#, ... B)
@@ -107,6 +113,66 @@ def _drop_regions(energy_curve: list[float], duration_sec: float, hop_length: in
     return regions
 
 
+def _load_audio(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
+    """
+    Load audio file as (y, sr). For m4a/webm/opus on Windows, tries ffmpeg conversion
+    if librosa fails (PySoundFile/audioread often need ffmpeg in PATH).
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Audio file not found: {path}")
+
+    try:
+        y, loaded_sr = librosa.load(str(path), sr=sr, mono=True)
+        return y, loaded_sr
+    except Exception as load_err:
+        ext = path.suffix.lower()
+        if ext not in _FFMPEG_FALLBACK_EXTS:
+            raise load_err
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            raise RuntimeError(
+                "m4a/YouTube audio on Windows needs ffmpeg. Install ffmpeg and add its bin folder to PATH. "
+                "See https://ffmpeg.org/download.html"
+            ) from load_err
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+        try:
+            subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    str(sr),
+                    "-f",
+                    "wav",
+                    wav_path,
+                ],
+                capture_output=True,
+                check=True,
+                timeout=120,
+            )
+            y, loaded_sr = librosa.load(wav_path, sr=sr, mono=True)
+            return y, loaded_sr
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode("utf-8", errors="replace").strip() or "unknown"
+            raise RuntimeError(
+                f"ffmpeg failed to convert {path.suffix} to wav: {stderr}"
+            ) from e
+        except FileNotFoundError:
+            raise RuntimeError(
+                "ffmpeg not found in PATH. Install ffmpeg and add its bin folder to PATH."
+            ) from load_err
+        finally:
+            Path(wav_path).unlink(missing_ok=True)
+
+
 def extract_track_features(audio_path: str | Path) -> TrackFeatureObject:
     """
     Load audio and extract Track Feature Object.
@@ -116,7 +182,7 @@ def extract_track_features(audio_path: str | Path) -> TrackFeatureObject:
     if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {path}")
 
-    y, sr = librosa.load(path, sr=22050, mono=True)
+    y, sr = _load_audio(path, sr=22050)
     duration_sec = float(librosa.get_duration(y=y, sr=sr))
     hop_length = 512
 
