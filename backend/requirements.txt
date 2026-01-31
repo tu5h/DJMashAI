@@ -17,3 +17,10 @@ google-genai>=1.0.0
 
 # YouTube audio extraction
 yt-dlp>=2024.1.0
+
+# Stem separation (optional, for stem-aware "Preview (stems)" transitions)
+# Use demucs on Python 3.12+ (spleeter is not compatible with 3.12)
+demucs>=4.0.0
+
+# Vocal phrase boundaries for clean transitions (replace, not overlap)
+openai-whisper>=20231117

@@ -25,18 +25,72 @@ KEY_NAMES = [
 MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
+# Camelot wheel for harmonic mixing: key name -> code (e.g. "8A" = compatible with 7A, 9A, 8B)
+KEY_TO_CAMELOT: dict[str, str] = {
+    "C major": "8B", "C minor": "5A", "C# major": "3B", "C# minor": "12A",
+    "D major": "10B", "D minor": "7A", "D# major": "5B", "D# minor": "2A",
+    "E major": "12B", "E minor": "9A", "F major": "7B", "F minor": "4A",
+    "F# major": "2B", "F# minor": "11A", "G major": "9B", "G minor": "6A",
+    "G# major": "4B", "G# minor": "1A", "A major": "11B", "A minor": "8A",
+    "A# major": "6B", "A# minor": "3A", "B major": "1B", "B minor": "10A",
+}
+
 
 class TrackFeatureObject(BaseModel):
     """Track Feature Object — per-track analysis output (Features.md)."""
     bpm: float = Field(..., description="Detected tempo (BPM)")
     key: str = Field(..., description="Estimated musical key (e.g. C major)")
+    camelot_code: str = Field(..., description="Camelot code for harmonic mixing (e.g. 8A)")
     energy_score: float = Field(..., ge=0, le=1, description="Overall energy 0–1")
     energy_curve: list[float] = Field(..., description="Energy over time (normalized)")
+    energy_segments: tuple[float, float, float] = Field(
+        ..., description="Energy in first/mid/last third (0–1) for energy arc"
+    )
     intro_window: tuple[float, float] = Field(..., description="(start_sec, end_sec) intro region")
     outro_window: tuple[float, float] = Field(..., description="(start_sec, end_sec) outro region")
+    first_beat_sec: float = Field(..., description="Time of first strong beat (sec) for phrase alignment")
     drop_regions: list[tuple[float, float]] = Field(default_factory=list, description="(start_sec, end_sec) drop zones")
     duration_sec: float = Field(..., description="Track length in seconds")
     loudness_profile: str = Field(default="normal", description="Loudness character: quiet | normal | loud")
+    vocal_phrase_ends: list[float] = Field(
+        default_factory=list,
+        description="Times (sec) where a vocal phrase ends, for clean transitions (no mid-word cut)",
+    )
+    vocal_phrase_starts: list[float] = Field(
+        default_factory=list,
+        description="Times (sec) where a vocal phrase starts, so incoming track links at phrase start",
+    )
+    vocal_segments: list[dict] = Field(
+        default_factory=list,
+        description="Full transcript segments: [{start, end, text}]; used for word-matching across tracks",
+    )
+    beat_times_sec: list[float] = Field(
+        default_factory=list,
+        description="All beat positions (sec) for beat-aligned transitions (AutoMasher-style extraction)",
+    )
+    chord_segments: list[dict] = Field(
+        default_factory=list,
+        description="Chord over time: [{start, end, chord}]; transition at chord change for cleaner handoffs",
+    )
+
+
+def _key_to_camelot(key: str) -> str:
+    """Convert key string (e.g. 'C major') to Camelot code for harmonic mixing."""
+    return KEY_TO_CAMELOT.get(key.strip(), "8A")
+
+
+def _energy_segments(energy_curve: list[float]) -> tuple[float, float, float]:
+    """Energy in first third, middle third, last third (0–1) for energy arc."""
+    n = len(energy_curve)
+    if n < 3:
+        v = float(np.mean(energy_curve)) if energy_curve else 0.5
+        return (v, v, v)
+    curve = np.array(energy_curve, dtype=float)
+    third = n // 3
+    start = float(np.mean(curve[:third]))
+    mid = float(np.mean(curve[third : 2 * third]))
+    end = float(np.mean(curve[2 * third :]))
+    return (round(min(1.0, max(0.0, start)), 4), round(min(1.0, max(0.0, mid)), 4), round(min(1.0, max(0.0, end)), 4))
 
 
 def _estimate_key(y: np.ndarray, sr: int) -> str:
@@ -92,6 +146,52 @@ def _intro_outro_windows(duration_sec: float, energy_curve: list[float], hop_len
     # Outro: last ~15–30 sec
     outro_start = max(0, duration_sec - 30)
     return (0.0, intro_end), (outro_start, duration_sec)
+
+
+def _chord_segments(y: np.ndarray, sr: int, hop_length: int, frame_dur: float, duration_sec: float) -> list[dict]:
+    """
+    Chroma-based chord segments over time (AutoMasher-style: chord labels for transition-at-chord-change).
+    Returns [{start, end, chord}] with chord as root name (e.g. C, Am). Simple template matching per window.
+    """
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    n_frames = chroma.shape[1]
+    if n_frames < 4:
+        return []
+    # Segment by ~2 sec windows, get dominant chord per window
+    window_frames = max(4, int(2.0 / frame_dur))
+    segments: list[dict] = []
+    prev_chord: str | None = None
+    seg_start_sec = 0.0
+    for i in range(0, n_frames, window_frames):
+        end_i = min(i + window_frames, n_frames)
+        chunk = chroma[:, i:end_i]
+        mean_chroma = np.mean(chunk, axis=1)
+        mean_chroma = mean_chroma / (np.linalg.norm(mean_chroma) + 1e-8)
+        best_key = "C"
+        best_corr = -2.0
+        for k in range(12):
+            major_rot = np.roll(MAJOR_PROFILE, k)
+            minor_rot = np.roll(MINOR_PROFILE, k)
+            major_rot = major_rot / (np.linalg.norm(major_rot) + 1e-8)
+            minor_rot = minor_rot / (np.linalg.norm(minor_rot) + 1e-8)
+            c_maj = np.corrcoef(mean_chroma, major_rot)[0, 1]
+            c_min = np.corrcoef(mean_chroma, minor_rot)[0, 1]
+            if c_maj > best_corr:
+                best_corr = c_maj
+                best_key = f"{KEY_NAMES[k]}"
+            if c_min > best_corr:
+                best_corr = c_min
+                best_key = f"{KEY_NAMES[k]}m"
+        start_sec = round(i * frame_dur, 1)
+        end_sec = round(min((end_i) * frame_dur, duration_sec), 1)
+        if prev_chord is None or best_key != prev_chord:
+            if prev_chord is not None:
+                segments[-1]["end"] = start_sec
+            segments.append({"start": start_sec, "end": end_sec, "chord": best_key})
+            prev_chord = best_key
+        else:
+            segments[-1]["end"] = end_sec
+    return segments
 
 
 def _drop_regions(energy_curve: list[float], duration_sec: float, hop_length: int, sr: int) -> list[tuple[float, float]]:
@@ -186,15 +286,20 @@ def extract_track_features(audio_path: str | Path) -> TrackFeatureObject:
     duration_sec = float(librosa.get_duration(y=y, sr=sr))
     hop_length = 512
 
-    # BPM
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
+    # BPM and full beat grid (AutoMasher-style: beat_times_sec for beat-aligned transitions)
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
     bpm = float(tempo)
+    frame_dur = hop_length / sr
+    first_beat_sec = float(beat_frames[0] * frame_dur) if beat_frames is not None and len(beat_frames) > 0 else 0.0
+    beat_times_sec = [round(float(f) * frame_dur, 2) for f in (beat_frames if beat_frames is not None else [])]
 
-    # Key
+    # Key and Camelot
     key = _estimate_key(y, sr)
+    camelot_code = _key_to_camelot(key)
 
-    # Energy curve and score
+    # Energy curve, score, and segments (first/mid/last third)
     energy_curve, energy_score = _energy_curve(y, sr, hop_length=hop_length)
+    energy_segments = _energy_segments(energy_curve)
 
     # Intro / outro
     intro_window, outro_window = _intro_outro_windows(duration_sec, energy_curve, hop_length, sr)
@@ -211,14 +316,22 @@ def extract_track_features(audio_path: str | Path) -> TrackFeatureObject:
     else:
         loudness_profile = "normal"
 
+    # Chord segments (chroma-based, for transition-at-chord-change)
+    chord_segments = _chord_segments(y, sr, hop_length, frame_dur, duration_sec)
+
     return TrackFeatureObject(
         bpm=bpm,
         key=key,
+        camelot_code=camelot_code,
         energy_score=round(energy_score, 4),
         energy_curve=[round(x, 4) for x in energy_curve],
+        energy_segments=energy_segments,
         intro_window=intro_window,
         outro_window=outro_window,
+        first_beat_sec=round(first_beat_sec, 2),
         drop_regions=drop_regions,
         duration_sec=round(duration_sec, 2),
         loudness_profile=loudness_profile,
+        beat_times_sec=beat_times_sec,
+        chord_segments=chord_segments,
     )

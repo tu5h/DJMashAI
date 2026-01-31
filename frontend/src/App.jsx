@@ -32,10 +32,18 @@ export default function App() {
   const [error, setError] = useState(null);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
   const [previewError, setPreviewError] = useState(null);
+  const [previewStartFromFirstTransition, setPreviewStartFromFirstTransition] = useState(false);
+  const [includeCommentary, setIncludeCommentary] = useState(false);
+  const [commentaryLines, setCommentaryLines] = useState([]);
+  const [loadingCommentary, setLoadingCommentary] = useState(false);
+  const [commentaryError, setCommentaryError] = useState(null);
+  const [loadingStemTransitionIndex, setLoadingStemTransitionIndex] = useState(null);
+  const [stemTransitionError, setStemTransitionError] = useState(null);
   const resultRef = useRef(null);
   const mixPlanRef = useRef(null);
   const audioContextRef = useRef(null);
   const scheduledSourcesRef = useRef([]);
+  const commentaryAudioRef = useRef(null);
 
   useEffect(() => {
     if (!loadingAnalyze || analyzingTotal <= 0) return;
@@ -212,36 +220,248 @@ export default function App() {
     for (let i = 0; i < transitions.length; i++) {
       mixStartTime.push(mixStartTime[i] + (transitions[i].transition_start_time ?? 0));
     }
+    const skipTo =
+      previewStartFromFirstTransition && mixStartTime.length > 1 ? mixStartTime[1] : 0;
+
+    // Pre-fetch transition sound effects (whoosh, filter_sweep, etc.) so mix feels like a real DJ
+    const sfxCache = {};
+    for (let i = 0; i < transitions.length; i++) {
+      const type = (transitions[i].transition_sound || "whoosh").toLowerCase();
+      if (type === "none" || sfxCache[type]) continue;
+      try {
+        const res = await fetch(`${API_BASE}/sound-effect?type=${encodeURIComponent(type)}&duration=0.5`);
+        if (res.ok) {
+          const ab = await res.arrayBuffer();
+          sfxCache[type] = await ctx.decodeAudioData(ab.slice(0));
+        }
+      } catch (_) {}
+    }
+
+    function gainAtMixTime(i, t) {
+      const startMix = mixStartTime[i];
+      const dur = buffers[i].duration;
+      if (t < startMix || t >= startMix + dur) return 0;
+      if (i === 0) {
+        if (!transitions[0]) return 1;
+        const rampStart = startMix + (transitions[0].transition_start_time ?? 0);
+        const crossfadeOut = Math.min(transitions[0].crossfade_duration_sec ?? 8, dur - (transitions[0].transition_start_time ?? 0));
+        const rampEnd = rampStart + crossfadeOut;
+        if (t < rampStart) return 1;
+        if (t >= rampEnd) return 0;
+        return 1 - (t - rampStart) / crossfadeOut;
+      }
+      const crossfadeIn = Math.min(transitions[i - 1].crossfade_duration_sec ?? 8, dur);
+      if (t < startMix + crossfadeIn) return (t - startMix) / crossfadeIn;
+      if (i >= transitions.length) return 1;
+      const rampStart = startMix + (transitions[i].transition_start_time ?? 0);
+      const crossfadeOut = Math.min(transitions[i].crossfade_duration_sec ?? 8, dur - (transitions[i].transition_start_time ?? 0));
+      const rampEnd = rampStart + crossfadeOut;
+      if (t < rampStart) return 1;
+      if (t >= rampEnd) return 0;
+      return 1 - (t - rampStart) / crossfadeOut;
+    }
+
     const sources = [];
     const now = ctx.currentTime;
+    const toCtx = (mixT) => now + (mixT - skipTo);
+
     for (let i = 0; i < buffers.length; i++) {
+      const startMix = mixStartTime[i];
+      const dur = buffers[i].duration;
+      const endMix = startMix + dur;
+      if (endMix <= skipTo) continue;
+
       const gainNode = ctx.createGain();
+      const filterNode = ctx.createBiquadFilter();
+      filterNode.type = "lowpass";
+      filterNode.frequency.setValueAtTime(20000, now);
+      filterNode.Q.setValueAtTime(0.7, now);
+      filterNode.connect(gainNode);
       gainNode.connect(ctx.destination);
       const src = ctx.createBufferSource();
       src.buffer = buffers[i];
-      src.connect(gainNode);
-      const startMix = mixStartTime[i];
-      const dur = buffers[i].duration;
-      gainNode.gain.setValueAtTime(i === 0 ? 1 : 0, now + startMix);
-      if (i > 0) {
-        const crossfade = transitions[i - 1].crossfade_duration_sec ?? 16;
-        gainNode.gain.linearRampToValueAtTime(1, now + startMix + Math.min(crossfade, dur));
+      src.connect(filterNode);
+
+      // Incoming track (i > 0) can start at word-matched offset; first track uses skip-to-intro offset when skipping
+      const bufferOffset =
+        i > 0 && transitions[i - 1].incoming_start_offset != null
+          ? Number(transitions[i - 1].incoming_start_offset)
+          : startMix < skipTo
+            ? skipTo - startMix
+            : 0;
+      let playDuration = dur - bufferOffset;
+      const startCtx = startMix >= skipTo ? now + (startMix - skipTo) : now;
+
+      // Outgoing track must STOP when crossfade ends (replace, not overlap) — time is "seconds into this track"
+      let stopCtx = startCtx + playDuration;
+      if (i < buffers.length - 1 && transitions[i]) {
+        const tStart = Number(transitions[i].transition_start_time ?? 0);
+        const tEnd =
+          transitions[i].transition_end_time != null
+            ? Number(transitions[i].transition_end_time)
+            : tStart + Number(transitions[i].crossfade_duration_sec ?? 8);
+        const maxPlaySec = Math.max(0, tEnd - bufferOffset);
+        playDuration = Math.min(playDuration, maxPlaySec);
+        stopCtx = startCtx + playDuration;
+      }
+
+      gainNode.gain.setValueAtTime(gainAtMixTime(i, skipTo), now);
+      const crossfadeInSec = i > 0 ? Math.min(transitions[i - 1].crossfade_duration_sec ?? 8, dur - bufferOffset) : 0;
+      const rampStart = i < transitions.length ? startMix + (transitions[i].transition_start_time ?? 0) : startMix;
+      const rampEnd =
+        i < transitions.length && transitions[i]
+          ? (transitions[i].transition_end_time != null
+              ? Number(transitions[i].transition_end_time)
+              : rampStart + Math.min(transitions[i].crossfade_duration_sec ?? 8, dur - (transitions[i].transition_start_time ?? 0)))
+          : rampStart;
+
+      // DJ-style filter manipulation: incoming = lowpass opens (muffled → full), outgoing = highpass cuts bass (full → thin)
+      if (i > 0 && startMix >= skipTo) {
+        filterNode.type = "lowpass";
+        filterNode.frequency.setValueAtTime(500, startCtx);
+        filterNode.frequency.linearRampToValueAtTime(20000, startCtx + crossfadeInSec);
+      }
+      if (i < buffers.length - 1 && transitions[i] && rampEnd > skipTo) {
+        filterNode.type = "highpass";
+        filterNode.frequency.setValueAtTime(30, toCtx(rampStart));
+        filterNode.frequency.linearRampToValueAtTime(1800, toCtx(rampEnd));
+      }
+
+      if (i > 0 && startMix < skipTo) {
+        const crossfade = transitions[i - 1].crossfade_duration_sec ?? 8;
+        const fadeEnd = startMix + Math.min(crossfade, dur);
+        if (fadeEnd > skipTo) gainNode.gain.linearRampToValueAtTime(1, toCtx(Math.min(fadeEnd, endMix)));
+      }
+      if (i > 0 && startMix >= skipTo) {
+        gainNode.gain.setValueAtTime(0, startCtx);
+        gainNode.gain.linearRampToValueAtTime(1, startCtx + crossfadeInSec);
       }
       if (i < buffers.length - 1 && transitions[i]) {
-        const crossfadeOut = transitions[i].crossfade_duration_sec ?? 16;
-        const rampStart = startMix + (transitions[i].transition_start_time ?? 0);
-        gainNode.gain.setValueAtTime(1, now + rampStart);
-        gainNode.gain.linearRampToValueAtTime(0, now + rampStart + Math.min(crossfadeOut, dur - (transitions[i].transition_start_time ?? 0)));
+        if (rampEnd > skipTo) {
+          gainNode.gain.setValueAtTime(1, toCtx(rampStart));
+          gainNode.gain.linearRampToValueAtTime(0, toCtx(rampEnd));
+        }
       }
-      src.start(now + startMix);
-      src.stop(now + startMix + dur);
+
+      src.start(startCtx, bufferOffset, playDuration);
+      src.stop(stopCtx);
       src.onended = () => {
         if (i === buffers.length - 1) setIsPreviewPlaying(false);
       };
       sources.push(src);
     }
+    // Play transition SFX at each handoff (whoosh, filter_sweep, etc.)
+    for (let i = 0; i < transitions.length; i++) {
+      const type = (transitions[i].transition_sound || "whoosh").toLowerCase();
+      if (type === "none" || !sfxCache[type]) continue;
+      const startAt = toCtx(mixStartTime[i + 1]);
+      if (startAt < now) continue;
+      const sfxSrc = ctx.createBufferSource();
+      sfxSrc.buffer = sfxCache[type];
+      sfxSrc.connect(ctx.destination);
+      sfxSrc.start(startAt);
+      sfxSrc.stop(startAt + sfxCache[type].duration);
+      sources.push(sfxSrc);
+    }
     scheduledSourcesRef.current = sources;
     setIsPreviewPlaying(true);
+  }
+
+  async function handleGenerateCommentary(e) {
+    e.preventDefault();
+    if (!mixPlan || !orderedTracks?.length) return;
+    setCommentaryError(null);
+    setCommentaryLines([]);
+    setLoadingCommentary(true);
+    try {
+      const res = await fetch(`${API_BASE}/commentary`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ordered_track_names: orderedTracks.map((t) => t.name),
+          transition_reasoning: transitions.map((t) => t.reasoning_text ?? ""),
+          style: mixStyle,
+        }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setCommentaryLines(data);
+    } catch (err) {
+      setCommentaryError(err.message || "Commentary failed.");
+    } finally {
+      setLoadingCommentary(false);
+    }
+  }
+
+  function playCommentaryLine(base64) {
+    if (!base64) return;
+    try {
+      if (commentaryAudioRef.current) {
+        commentaryAudioRef.current.pause();
+        commentaryAudioRef.current = null;
+      }
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      commentaryAudioRef.current = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        commentaryAudioRef.current = null;
+      };
+      audio.play();
+    } catch (_) {}
+  }
+
+  async function playStemTransition(transitionIndex) {
+    if (!mixPlan || !orderedTracks?.length || !transitions[transitionIndex]) return;
+    const trackA = orderedTracks[transitionIndex];
+    const trackB = orderedTracks[transitionIndex + 1];
+    if (!trackA?.sourceFile || !trackB?.sourceFile) {
+      setStemTransitionError("Stem preview needs both tracks as uploaded files (no YouTube).");
+      return;
+    }
+    setStemTransitionError(null);
+    setLoadingStemTransitionIndex(transitionIndex);
+    try {
+      const t = transitions[transitionIndex];
+      const formData = new FormData();
+      formData.append("file_a", trackA.sourceFile);
+      formData.append("file_b", trackB.sourceFile);
+      formData.append("transition_start_a", String(t.transition_start_time ?? 0));
+      formData.append("crossfade_duration_sec", String(t.crossfade_duration_sec ?? 8));
+      formData.append("bpm_a", String(trackA.features.bpm ?? 120));
+      formData.append("bpm_b", String(trackB.features.bpm ?? 120));
+      formData.append("style", mixStyle);
+      const res = await fetch(`${API_BASE}/stem-transition-preview`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const base64 = data.audio_base64;
+      if (!base64) return;
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = () => URL.revokeObjectURL(url);
+      audio.play();
+    } catch (err) {
+      setStemTransitionError(err.message || "Stem transition failed.");
+    } finally {
+      setLoadingStemTransitionIndex(null);
+    }
   }
 
   const orderedTracks = mixPlan
@@ -249,6 +469,41 @@ export default function App() {
     : [];
   const transitions = mixPlan?.transitions ?? [];
   const energyCurve = mixPlan?.energy_curve ?? [];
+
+  // Mix timeline in seconds (for beat grid, phrase markers, transition highlight)
+  const mixStartTimeSec =
+    transitions.length > 0
+      ? (() => {
+          const t = [0];
+          for (let i = 0; i < transitions.length; i++)
+            t.push(t[t.length - 1] + (transitions[i].transition_start_time ?? 0));
+          return t;
+        })()
+      : orderedTracks.length ? [0] : [];
+  const mixDurationSec =
+    orderedTracks.length && mixStartTimeSec.length === orderedTracks.length
+      ? mixStartTimeSec[mixStartTimeSec.length - 1] +
+        (orderedTracks[orderedTracks.length - 1].features?.duration_sec ?? 0)
+      : 0;
+  const avgBpm =
+    orderedTracks.length > 0
+      ? orderedTracks.reduce((s, t) => s + (t.features?.bpm ?? 120), 0) / orderedTracks.length
+      : 120;
+  const beatIntervalSec = 60 / avgBpm;
+  const phraseMarkers = []; // { mixSec, label } — phrase ends/starts in mix time
+  if (orderedTracks.length && mixStartTimeSec.length === orderedTracks.length) {
+    orderedTracks.forEach((t, i) => {
+      const start = mixStartTimeSec[i] ?? 0;
+      const ends = t.features?.vocal_phrase_ends ?? [];
+      const starts = t.features?.vocal_phrase_starts ?? [];
+      ends.forEach((sec) => {
+        if (sec >= 0) phraseMarkers.push({ mixSec: start + sec, label: "phrase end" });
+      });
+      starts.forEach((sec) => {
+        if (sec >= 0) phraseMarkers.push({ mixSec: start + sec, label: "phrase start" });
+      });
+    });
+  }
 
   const curveBoundaries = orderedTracks.length
     ? (() => {
@@ -452,28 +707,53 @@ export default function App() {
                     {t.features.bpm.toFixed(0)} BPM · {(t.features.energy_score * 100).toFixed(0)}%
                   </span>
                   {i < orderedTracks.length - 1 && (
-                    <button
-                      type="button"
-                      style={{
-                        ...styles.transitionBtn,
-                        ...(selectedTransitionIndex === i ? styles.transitionBtnActive : {}),
-                      }}
-                      onClick={() =>
-                        setSelectedTransitionIndex(selectedTransitionIndex === i ? null : i)
-                      }
-                      title="Why this transition?"
-                    >
-                      → transition
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        style={{
+                          ...styles.transitionBtn,
+                          ...(selectedTransitionIndex === i ? styles.transitionBtnActive : {}),
+                        }}
+                        onClick={() =>
+                          setSelectedTransitionIndex(selectedTransitionIndex === i ? null : i)
+                        }
+                        title="Why this transition?"
+                      >
+                        → transition
+                      </button>
+                      {orderedTracks[i].sourceFile && orderedTracks[i + 1].sourceFile && (
+                        <button
+                          type="button"
+                          style={{
+                            ...styles.transitionBtn,
+                            ...(loadingStemTransitionIndex === i ? styles.buttonDisabled : {}),
+                          }}
+                          onClick={() => playStemTransition(i)}
+                          disabled={loadingStemTransitionIndex === i}
+                          title="Preview this transition with stems (no vocal overlap)"
+                        >
+                          {loadingStemTransitionIndex === i ? "…" : "Preview (stems)"}
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               ))}
             </div>
 
+            {stemTransitionError && (
+              <p style={styles.previewError}>{stemTransitionError}</p>
+            )}
             {transitions.length > 0 &&
               selectedTransitionIndex !== null &&
               transitions[selectedTransitionIndex] && (
                 <div style={styles.reasoningBox}>
+                  <div style={styles.reasoningHeader}>
+                    <span style={styles.reasoningDJ}>DJ says</span>
+                    <span style={styles.reasoningSFX}>
+                      SFX: {(transitions[selectedTransitionIndex].transition_sound || "whoosh").replace("_", " ")}
+                    </span>
+                  </div>
                   <h3 style={styles.reasoningTitle}>
                     Why {orderedTracks[selectedTransitionIndex]?.name} →{" "}
                     {orderedTracks[selectedTransitionIndex + 1]?.name}?
@@ -488,13 +768,70 @@ export default function App() {
                     {transitions[selectedTransitionIndex].transition_end_time}s ·{" "}
                     {transitions[selectedTransitionIndex].crossfade_duration_sec}s crossfade ·{" "}
                     {transitions[selectedTransitionIndex].eq_strategy}
+                    {transitions[selectedTransitionIndex].matched_word != null && (
+                      <> · Word match: &quot;{transitions[selectedTransitionIndex].matched_word}&quot;
+                        {transitions[selectedTransitionIndex].incoming_start_offset != null && (
+                          <> (incoming from {transitions[selectedTransitionIndex].incoming_start_offset}s)</>
+                        )}
+                      </>
+                    )}
                   </p>
                 </div>
               )}
 
-            {curveSamples.length > 0 && (
+            {curveSamples.length > 0 && mixDurationSec > 0 && (
               <div style={styles.curveSection}>
                 <h3 style={styles.curveTitle}>Energy curve (mix) — each track in its own colour</h3>
+                <div style={styles.timelineStrip}>
+                  <div style={styles.timelineStripLabel}>Beat grid · phrase markers · transition window</div>
+                  <div style={styles.timelineStripBar}>
+                    {selectedTransitionIndex !== null && transitions[selectedTransitionIndex] && (() => {
+                      const t = transitions[selectedTransitionIndex];
+                      const winStart = mixStartTimeSec[selectedTransitionIndex + 1] ?? 0;
+                      const winEnd = winStart + (t.crossfade_duration_sec ?? 8);
+                      const left = (winStart / mixDurationSec) * 100;
+                      const width = ((winEnd - winStart) / mixDurationSec) * 100;
+                      return (
+                        <div
+                          className="timeline-transition-window"
+                          style={{
+                            ...styles.transitionWindowHighlight,
+                            left: `${left}%`,
+                            width: `${width}%`,
+                          }}
+                          title={`Transition window ${winStart.toFixed(0)}s – ${winEnd.toFixed(0)}s`}
+                        />
+                      );
+                    })()}
+                    {Array.from({ length: Math.floor(mixDurationSec / beatIntervalSec) + 1 }, (_, i) => i * beatIntervalSec)
+                      .filter((t) => t <= mixDurationSec)
+                      .map((t) => (
+                        <div
+                          key={t}
+                          style={{
+                            ...styles.beatTick,
+                            left: `${(t / mixDurationSec) * 100}%`,
+                          }}
+                          title={`${t.toFixed(1)}s`}
+                        />
+                      ))}
+                    {phraseMarkers.slice(0, 40).map((pm, idx) => (
+                      <div
+                        key={idx}
+                        style={{
+                          ...styles.phraseMarker,
+                          left: `${(pm.mixSec / mixDurationSec) * 100}%`,
+                        }}
+                        title={pm.label}
+                      />
+                    ))}
+                  </div>
+                  <div style={styles.timelineStripTime}>
+                    {[0, Math.round(mixDurationSec / 4), Math.round(mixDurationSec / 2), Math.round((3 * mixDurationSec) / 4), Math.round(mixDurationSec)].filter((s) => s <= mixDurationSec).map((s) => (
+                      <span key={s} style={{ position: "absolute", left: `${(s / mixDurationSec) * 100}%`, transform: "translateX(-50%)", fontSize: "0.7rem", color: "#71717a" }}>{s}s</span>
+                    ))}
+                  </div>
+                </div>
                 <div style={styles.curveContainer}>
                   {curveSamples.map(({ i, v, trackIdx }, idx) => (
                     <div
@@ -526,6 +863,16 @@ export default function App() {
                       ? "Play the mix in planned order with crossfades at each transition (uploaded files only)."
                       : "Upload all tracks as files (no YouTube links) to enable mix preview."}
                   </p>
+                  {canPreview && (
+                    <label style={styles.toggleRow}>
+                      <input
+                        type="checkbox"
+                        checked={previewStartFromFirstTransition}
+                        onChange={(e) => setPreviewStartFromFirstTransition(e.target.checked)}
+                      />
+                      <span style={styles.toggleLabel}>Start from first transition (skip intro)</span>
+                    </label>
+                  )}
                   {previewError && <p style={styles.previewError}>{previewError}</p>}
                   <div style={styles.previewButtons}>
                     {!isPreviewPlaying ? (
@@ -546,6 +893,57 @@ export default function App() {
                 </div>
               );
             })()}
+
+            <div style={styles.previewSection}>
+              <label style={styles.toggleRow}>
+                <input
+                  type="checkbox"
+                  checked={includeCommentary}
+                  onChange={(e) => setIncludeCommentary(e.target.checked)}
+                />
+                <span style={styles.toggleLabel}>Include DJ commentary</span>
+              </label>
+              {includeCommentary && (
+                <>
+                  <p style={styles.previewHint}>
+                    Generate short MC lines (intro, transition callouts, outro) with Gemini; optional voice via ElevenLabs.
+                  </p>
+                  {commentaryError && <p style={styles.previewError}>{commentaryError}</p>}
+                  <div style={styles.previewButtons}>
+                    <button
+                      type="button"
+                      style={styles.button}
+                      onClick={handleGenerateCommentary}
+                      disabled={loadingCommentary}
+                    >
+                      {loadingCommentary ? "Generating…" : "Generate DJ commentary"}
+                    </button>
+                  </div>
+                  {commentaryLines.length > 0 && (
+                    <ul style={styles.commentaryList}>
+                      {commentaryLines.map((line, i) => (
+                        <li key={i} style={styles.commentaryItem}>
+                          <span style={styles.commentaryLabel}>{line.label}</span>
+                          <span style={styles.commentaryText}>"{line.text}"</span>
+                          {line.audio_base64 ? (
+                            <button
+                              type="button"
+                              style={styles.commentaryPlayBtn}
+                              onClick={() => playCommentaryLine(line.audio_base64)}
+                              title="Play"
+                            >
+                              ▶ Play
+                            </button>
+                          ) : (
+                            <span style={styles.commentaryNoVoice}>No voice (set ELEVENLABS_API_KEY)</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+            </div>
           </section>
         )}
       </main>
@@ -781,14 +1179,59 @@ const styles = {
   },
   reasoningBox: {
     marginTop: "1rem",
-    padding: "1rem",
-    borderRadius: 8,
-    background: "#27272a",
-    border: "1px solid #3f3f46",
+    padding: "1.25rem",
+    borderRadius: 12,
+    background: "linear-gradient(135deg, #1e1b4b 0%, #27272a 100%)",
+    border: "1px solid #6366f1",
+    boxShadow: "0 4px 20px rgba(99, 102, 241, 0.15)",
   },
-  reasoningTitle: { margin: "0 0 0.5rem", fontSize: "0.95rem", color: "#fafafa", fontWeight: 600 },
-  reasoningText: { margin: 0, color: "#e4e4e7", fontSize: "0.9rem", lineHeight: 1.5 },
+  reasoningHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" },
+  reasoningDJ: { fontSize: "0.75rem", fontWeight: 700, color: "#a78bfa", textTransform: "uppercase", letterSpacing: "0.05em" },
+  reasoningSFX: { fontSize: "0.75rem", color: "#22d3ee" },
+  reasoningTitle: { margin: "0 0 0.5rem", fontSize: "1rem", color: "#fafafa", fontWeight: 600 },
+  reasoningText: { margin: 0, color: "#e4e4e7", fontSize: "0.95rem", lineHeight: 1.6 },
   reasoningMeta: { margin: "0.5rem 0 0", color: "#a1a1aa", fontSize: "0.8rem" },
+  timelineStrip: { marginBottom: "0.75rem" },
+  timelineStripLabel: { fontSize: "0.75rem", color: "#71717a", marginBottom: "0.25rem" },
+  timelineStripBar: {
+    position: "relative",
+    height: 20,
+    background: "#27272a",
+    borderRadius: 6,
+    overflow: "visible",
+  },
+  transitionWindowHighlight: {
+    position: "absolute",
+    top: 0,
+    height: "100%",
+    background: "rgba(99, 102, 241, 0.35)",
+    borderRadius: 4,
+    pointerEvents: "none",
+  },
+  beatTick: {
+    position: "absolute",
+    top: 0,
+    width: 1,
+    height: "100%",
+    background: "rgba(113, 113, 122, 0.5)",
+    pointerEvents: "none",
+    transform: "translateX(-50%)",
+  },
+  phraseMarker: {
+    position: "absolute",
+    top: "50%",
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+    background: "#22c55e",
+    transform: "translate(-50%, -50%)",
+    pointerEvents: "none",
+  },
+  timelineStripTime: {
+    position: "relative",
+    height: 16,
+    marginTop: 2,
+  },
   curveSection: {
     marginTop: "1.25rem",
     paddingTop: "1.25rem",
@@ -820,4 +1263,25 @@ const styles = {
   previewError: { margin: "0 0 0.5rem", fontSize: "0.875rem", color: "#fca5a5" },
   previewButtons: { display: "flex", gap: "0.5rem", alignItems: "center" },
   buttonDisabled: { opacity: 0.6, cursor: "not-allowed" },
+  commentaryList: { listStyle: "none", padding: 0, margin: "0.75rem 0 0" },
+  commentaryItem: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: "0.5rem",
+    padding: "0.5rem 0",
+    borderBottom: "1px solid #27272a",
+  },
+  commentaryLabel: { fontSize: "0.8rem", color: "#818cf8", fontWeight: 600, minWidth: 90 },
+  commentaryText: { flex: "1 1 200px", fontSize: "0.9rem", color: "#e4e4e7" },
+  commentaryPlayBtn: {
+    padding: "0.25rem 0.5rem",
+    borderRadius: 6,
+    border: "1px solid #3f3f46",
+    background: "#27272a",
+    color: "#22c55e",
+    fontSize: "0.8rem",
+    cursor: "pointer",
+  },
+  commentaryNoVoice: { fontSize: "0.8rem", color: "#71717a" },
 };
