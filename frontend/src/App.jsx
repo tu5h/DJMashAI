@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const API_BASE = "/api";
 
@@ -7,6 +7,13 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
+  const resultRef = useRef(null);
+
+  useEffect(() => {
+    if (result && resultRef.current) {
+      resultRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [result]);
 
   async function handleAnalyze(e) {
     e.preventDefault();
@@ -64,6 +71,15 @@ export default function App() {
           </button>
         </form>
 
+        {loading && (
+          <div style={styles.loadingWrap}>
+            <div style={styles.loadingBar}>
+              <div className="loading-fill" style={styles.loadingFill} />
+            </div>
+            <p style={styles.loadingText}>Analyzing track…</p>
+          </div>
+        )}
+
         {error && (
           <div style={styles.error}>
             {error}
@@ -71,7 +87,7 @@ export default function App() {
         )}
 
         {result && (
-          <section style={styles.result}>
+          <section ref={resultRef} style={styles.result}>
             <h2 style={styles.resultTitle}>Track features</h2>
             <dl style={styles.dl}>
               <div style={styles.row}>
@@ -200,6 +216,27 @@ const styles = {
     fontWeight: 600,
     fontSize: "0.95rem",
     cursor: "pointer",
+  },
+  loadingWrap: {
+    marginBottom: "1.5rem",
+  },
+  loadingBar: {
+    height: 6,
+    borderRadius: 3,
+    background: "#27272a",
+    overflow: "hidden",
+    marginBottom: "0.5rem",
+  },
+  loadingFill: {
+    height: "100%",
+    width: "40%",
+    background: "linear-gradient(90deg, #6366f1, #818cf8)",
+    borderRadius: 3,
+  },
+  loadingText: {
+    margin: 0,
+    fontSize: "0.875rem",
+    color: "#a1a1aa",
   },
   error: {
     padding: "0.75rem 1rem",

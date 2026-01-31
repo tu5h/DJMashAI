@@ -21,3 +21,20 @@ body {
 #root {
   min-height: 100vh;
 }
+
+/* Loading bar animation */
+@keyframes loadingSlide {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(150%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+.loading-fill {
+  animation: loadingSlide 1.2s ease-in-out infinite;
+}
